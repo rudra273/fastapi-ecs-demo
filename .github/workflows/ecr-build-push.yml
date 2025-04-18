@@ -9,12 +9,12 @@ on:
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}         # Pulled from your GitHub Secrets
   ECR_REPOSITORY: fastapiapp                    # Your ECR Repository Name
-  ECS_CLUSTER: dev             
-  ECS_SERVICE: fastapi-app-service              # <--- Add: Your ECS Service Name
-  TASK_DEFINITION_FAMILY: fastapi-app-task      # <--- Add: Your ECS Task Definition Family Name
+  ECS_CLUSTER: dev             # Your ECS Cluster Name
+  ECS_SERVICE: fastapi-app-service              # Your ECS Service Name
+  TASK_DEFINITION_FAMILY: fastapi-app-task      # Your ECS Task Definition Family Name
 
 jobs:
-  build_and_deploy: 
+  build_and_deploy: # Renamed job for clarity
     name: Build, Push, and Deploy to ECS
     runs-on: ubuntu-latest
 
@@ -34,28 +34,20 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build, Tag, and Push the Docker image
-        id: build-image # Assign an ID to capture outputs if needed
+        id: build-image
         run: |
-          # Get AWS account ID dynamically
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
-          IMAGE_TAG=${GITHUB_SHA::8} # Use the first 8 characters of the commit SHA as tag
+          IMAGE_TAG=${GITHUB_SHA::8}
 
-          # Full image URI for the new image
           NEW_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
           echo "Building image with tag ${NEW_IMAGE_URI}"
 
-          # Build the Docker image
-          # Uses the Dockerfile in the root of the repo
           docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
-
-          # Tag the images with the full ECR repository URI
           docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${NEW_IMAGE_URI}
-          # Also tag with 'latest' for the main branch
           docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
 
-          # Push the tagged images to ECR
           echo "Pushing images to ECR..."
           docker push ${NEW_IMAGE_URI}
           docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
@@ -64,28 +56,30 @@ jobs:
           # Output the new image URI for the next step
           echo "NEW_IMAGE_URI=${NEW_IMAGE_URI}" >> $GITHUB_ENV
 
+
       - name: Download current Task Definition
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
             --query 'taskDefinition' \
             --output json > task-definition.json
+          echo "Downloaded task definition for ${{ env.TASK_DEFINITION_FAMILY }}"
+
 
       - name: Update image in Task Definition and Register new Revision
         run: |
-          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
-          IMAGE_TAG=${GITHUB_SHA::8}
-          NEW_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" # Recalculate or use $NEW_IMAGE_URI from GITHUB_ENV
-
+          NEW_IMAGE_URI=${{ env.NEW_IMAGE_URI }}
           echo "Using new image URI: ${NEW_IMAGE_URI}"
 
           # Use jq to update the image URI in the container definition
-          # Assumes your container is named 'fastapi-container' as in the manual setup
           jq '.containerDefinitions |= map(if .name == "fastapi-container" then .image = env.NEW_IMAGE_URI else . end)' task-definition.json > task-definition-modified.json
 
           # Clean up extraneous fields from the JSON before registering
-          jq 'del(.taskDefinitionArn, .revision, .status, .compatibilities, .requiresAttributes, .registeredAt, .deregisteredAt)' task-definition-modified.json > task-definition-clean.json
+          # Corrected: Added '.registeredBy'
+          jq 'del(.taskDefinitionArn, .revision, .status, .compatibilities, .requiresAttributes, .registeredAt, .deregisteredAt, .registeredBy)' task-definition-modified.json > task-definition-clean.json
+
+          # Log the clean JSON for debugging if needed (remove in production)
+          # cat task-definition-clean.json
 
           # Register the new Task Definition revision
           echo "Registering new Task Definition revision..."
@@ -101,17 +95,25 @@ jobs:
           echo "Updating ECS Service ${{ env.ECS_SERVICE }} in cluster ${{ env.ECS_CLUSTER }}..."
 
           # Find the ARN of the *latest* task definition for the family
+          # This should be the one we just registered
           NEW_TASK_DEFINITION_ARN=$(aws ecs describe-task-definition \
             --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
+
+          # Check if ARN was retrieved
+          if [ -z "$NEW_TASK_DEFINITION_ARN" ]; then
+            echo "Error: Could not retrieve ARN for the new task definition."
+            exit 1
+          fi
+          echo "Latest Task Definition ARN: ${NEW_TASK_DEFINITION_ARN}"
 
           # Update the ECS service to use the new task definition revision
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --task-definition ${NEW_TASK_DEFINITION_ARN} \
-            --force-new-deployment # Forces a new deployment even if Task Definition ARN is the same (useful if only image tag content changed)
+            --force-new-deployment # Forces a new deployment
 
-          echo "ECS Service update initiated."
+          echo "ECS Service update initiated successfully."
           # Note: The service update takes some time in AWS, this step just initiates it.
