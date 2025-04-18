@@ -12,3 +12,4 @@ async def read_root():
     """
     return {"message": "Hello, World! This is my first FastAPI on ECS (eventually)!"}
 
+# new line
