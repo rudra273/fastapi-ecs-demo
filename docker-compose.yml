@@ -1,0 +1,9 @@
+# docker-compose.yml
+version: '3.8' # Specify the Docker Compose file format version
+
+services:
+  web: # Define a service named 'web'
+    build: . # Build the image using the Dockerfile in the current directory
+    ports:
+      - "8000:8000" # Map port 8000 on your host machine to port 8000 in the container
+    restart: unless-stopped # Automatically restart the container unless it's explicitly stopped

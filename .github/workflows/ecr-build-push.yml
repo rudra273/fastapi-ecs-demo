@@ -1,0 +1,61 @@
+# .github/workflows/ecr-build-push.yml
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main # Trigger this workflow on push to the main branch
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}         # Pulled from your GitHub Secrets
+  ECR_REPOSITORY: fastapiapp                    # <--- Your ECR Repository Name as specified
+
+jobs:
+  build_and_push:
+    name: Build and Push Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # Action to check out your repository code
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4 # Action to configure AWS credentials
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr # Assign an ID to this step
+        uses: aws-actions/amazon-ecr-login@v2 # Action to handle ECR login
+
+      - name: Build, Tag, and Push the Docker image
+        run: |
+          # Get AWS account ID dynamically
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          IMAGE_TAG=${GITHUB_SHA::8} # Use the first 8 characters of the commit SHA as tag
+
+          # Build the Docker image
+          # Uses the Dockerfile in the root of the repo
+          docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
+
+          # Tag the image with the full ECR repository URI
+          docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+
+          # Also tag with 'latest' for the main branch
+          docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+          # Push the tagged images to ECR
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+      - name: Print ECR Image URI
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          IMAGE_TAG=${GITHUB_SHA::8}
+          echo "Successfully pushed image:"
+          echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
