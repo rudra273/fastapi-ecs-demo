@@ -12,4 +12,11 @@ async def read_root():
     """
     return {"message": "Hello, World! This is my first FastAPI on ECS (eventually)!"}
 
+@app.get("/items/")
+async def read_items():
+    """
+    Endpoint to return a list of items.
+    """
+    return {"items": ["item1", "item2", "item3"]}
+
 # new line

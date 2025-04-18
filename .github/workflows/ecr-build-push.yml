@@ -1,5 +1,5 @@
 # .github/workflows/ecr-build-push.yml
-name: Build and Push to ECR
+name: Build and Deploy to ECR and ECS
 
 on:
   push:
@@ -8,54 +8,110 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}         # Pulled from your GitHub Secrets
-  ECR_REPOSITORY: fastapiapp                    # <--- Your ECR Repository Name as specified
+  ECR_REPOSITORY: fastapiapp                    # Your ECR Repository Name
+  ECS_CLUSTER: dev             
+  ECS_SERVICE: fastapi-app-service              # <--- Add: Your ECS Service Name
+  TASK_DEFINITION_FAMILY: fastapi-app-task      # <--- Add: Your ECS Task Definition Family Name
 
 jobs:
-  build_and_push:
-    name: Build and Push Docker image
+  build_and_deploy: 
+    name: Build, Push, and Deploy to ECS
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4 # Action to check out your repository code
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4 # Action to configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr # Assign an ID to this step
-        uses: aws-actions/amazon-ecr-login@v2 # Action to handle ECR login
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build, Tag, and Push the Docker image
+        id: build-image # Assign an ID to capture outputs if needed
         run: |
           # Get AWS account ID dynamically
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           IMAGE_TAG=${GITHUB_SHA::8} # Use the first 8 characters of the commit SHA as tag
 
+          # Full image URI for the new image
+          NEW_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "Building image with tag ${NEW_IMAGE_URI}"
+
           # Build the Docker image
           # Uses the Dockerfile in the root of the repo
           docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
 
-          # Tag the image with the full ECR repository URI
-          docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-
+          # Tag the images with the full ECR repository URI
+          docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${NEW_IMAGE_URI}
           # Also tag with 'latest' for the main branch
           docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
 
           # Push the tagged images to ECR
-          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+          echo "Pushing images to ECR..."
+          docker push ${NEW_IMAGE_URI}
           docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+          echo "Images pushed successfully."
 
-      - name: Print ECR Image URI
+          # Output the new image URI for the next step
+          echo "NEW_IMAGE_URI=${NEW_IMAGE_URI}" >> $GITHUB_ENV
+
+      - name: Download current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
+
+      - name: Update image in Task Definition and Register new Revision
         run: |
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           IMAGE_TAG=${GITHUB_SHA::8}
-          echo "Successfully pushed image:"
-          echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+          NEW_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" # Recalculate or use $NEW_IMAGE_URI from GITHUB_ENV
+
+          echo "Using new image URI: ${NEW_IMAGE_URI}"
+
+          # Use jq to update the image URI in the container definition
+          # Assumes your container is named 'fastapi-container' as in the manual setup
+          jq '.containerDefinitions |= map(if .name == "fastapi-container" then .image = env.NEW_IMAGE_URI else . end)' task-definition.json > task-definition-modified.json
+
+          # Clean up extraneous fields from the JSON before registering
+          jq 'del(.taskDefinitionArn, .revision, .status, .compatibilities, .requiresAttributes, .registeredAt, .deregisteredAt)' task-definition-modified.json > task-definition-clean.json
+
+          # Register the new Task Definition revision
+          echo "Registering new Task Definition revision..."
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition-clean.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text
+
+          echo "New Task Definition revision registered."
+
+
+      - name: Update ECS Service
+        run: |
+          echo "Updating ECS Service ${{ env.ECS_SERVICE }} in cluster ${{ env.ECS_CLUSTER }}..."
+
+          # Find the ARN of the *latest* task definition for the family
+          NEW_TASK_DEFINITION_ARN=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          # Update the ECS service to use the new task definition revision
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${NEW_TASK_DEFINITION_ARN} \
+            --force-new-deployment # Forces a new deployment even if Task Definition ARN is the same (useful if only image tag content changed)
+
+          echo "ECS Service update initiated."
+          # Note: The service update takes some time in AWS, this step just initiates it.
